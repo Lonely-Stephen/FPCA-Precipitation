@@ -1,0 +1,533 @@
+---
+title: "FPCA_precipitation"
+author: "Zhaohong Yang"
+date: "12/6/2021"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = 'E:/Code/R/Research/precipitation/FusedData')
+```
+
+# Load Packages
+
+```{r, warning=FALSE}
+library(fda)
+library(cluster)
+library(ggplot2)
+library(gganimate)
+library(LICORS)
+library(RColorBrewer)
+library(tidyverse)
+library(bios2mds)
+library(foreach)
+library(doParallel)
+library(parallel)
+numCores <- detectCores()
+registerDoParallel(numCores)
+```
+
+# Main functions(must load)
+
+## set up the functional data structure
+
+Use bspline as the smoothing basis.
+Here in fdabasis function, the second parameter should be greater than or equal to norder.
+Depending on the rolling window size, endtime should at least be the window size.
+
+```{r}
+gen.fdafd <- function(endtime, data, window.len){
+  fdabasis = create.bspline.basis(c(1, window.len), floor(window.len/6))
+  fdatime = seq(1, window.len)
+  fdafd = smooth.basis(fdatime, t(data[,(endtime-window.len+1):endtime]), fdabasis)$fd
+  fdafd$fdnames[[1]] = "Timestate"
+  fdafd$fdnames[[2]] = "Precipitation"
+  return(fdafd)
+}
+```
+
+## Return the PC scores
+
+endtime should at least be 24
+
+```{r}
+PCscore <- function(endt, data, window.len, nharm=2){
+  if (endt < 24){
+      stop("Wrong Time Range, need a T>=24")
+  }
+    
+  fdafd <- gen.fdafd(endt, data, window.len)
+  fdapcaList <- pca.fd(fdafd,nharm)
+  # PC Scores
+  PCScores <- data.frame(fdapcaList$scores[,1], fdapcaList$scores[,2])
+  colnames(PCScores) <- c("Harm1","Harm2")
+  return(PCScores)
+}
+```
+
+# Calculate the empirical WCSS quantile derived from bootstrap samples
+
+1.  Use K-Means to participate into the max number of clusters(either true or over-clustering).
+2.  Calculate residuals by removing each cluster mean.
+3.  Bootstrap residuals and add the cluster mean back to form bootstrap samples.
+4.  Repeat 3 for boot.time times.
+5.  Perform K-Means on each bootstrap sample and calculate the WCSS.
+6.  Derive the $97\%$(can be modified) of WCSS from bootstrap samples.
+
+You can adjust bootstrap time and quantile level here.
+(Default value: 500 bootstrap time, quantile level =95%)
+
+```{r}
+empirical_level <- function(score, k, boot.time = 500, quantile = 0.95){
+  # Participate scores into the max number of clusters that trying to estimate
+  c <- kmeanspp(score, k[length(k)], iter.max = 500)
+  c.list <- c$cluster
+  c.center <- c$centers # nx2 matrix (n is the number of number of clusters trying to estimate)
+  
+  # Calculate residuals by removing each cluster mean
+  res <- score
+  res['Cluster'] <- c.list
+  for (i in 1:k[length(k)]){
+      res[which(res['Cluster']==i),]['Harm1'] <- res[which(res['Cluster']==i),]['Harm1']-c.center[i,1]
+      res[which(res['Cluster']==i),]['Harm2'] <- res[which(res['Cluster']==i),]['Harm2']-c.center[i,2]
+  }
+
+  
+  # Bootstrap residuals and add the cluster mean back to form bootstrap samples.
+  boot.WCSS <- c()
+  boot.WCSS <- foreach (i = 1:boot.time, .combine=c) %dopar% {
+  # for (i in 1:boot.time) {
+                  c_sample <- c()
+                  for (j in 1:k[length(k)]){
+                      c_res <- res[which(res['Cluster']==j),]
+                      row.names(c_res) <- c(1:nrow(c_res))
+                      boot.res <- c_res[sample(1:nrow(c_res), nrow(c_res), replace=TRUE),]
+                      # add cluster mean
+                      boot.res['Harm1'] <- boot.res['Harm1']+c.center[j,1]
+                      boot.res['Harm2'] <- boot.res['Harm2']+c.center[j,2]
+                      # combine bootstrap samples
+                      c_sample <- rbind(c_sample, boot.res)
+                  }
+                  kmeans(c_sample, k[length(k)])$tot.withinss
+                  # WCSSi <- kmeans(c_sample, k[length(k)])$tot.withinss
+                  # boot.WCSS <- c(boot.WCSS, WCSSi)
+              }
+  return(unname(quantile(boot.WCSS, prob = quantile)))
+}
+```
+
+# Calculate k-means Score (WCSS+penalty)
+
+Penalty = $\hat{c}*k*log(n)$.
+Here $\hat{c}$ is a data-adaptive constant which derived from bootstrap samples of PCscore.
+t.length is the duration of the time series: for expanding window, it is the time when the time series end; for a sliding window, it is the window size.
+(At least 30!)
+
+power controls the penalty term related to the cluster number k.
+
+```{r}
+Cal.kScore <- function(endt, data, power, window.len, k){
+    size = nrow(data)
+    An = log(window.len * size)
+    pcs <- PCscore(endt, data, window.len)
+    WCSS_quantile <- empirical_level(pcs, k)
+    # WCSS_quantile <- empirical_level(pcs, k, quantile=0.5)
+    c_hat <- abs(WCSS_quantile - kmeanspp(pcs, k[length(k)], iter.max = 500)$tot.withinss)/log(An)
+    penalty = c()
+    cluster <- c()
+    kScore <- c()
+    for (i in 1:length(k)){
+      penalty <- c(penalty, c_hat * k[i]^power * An)
+      if (k[i] == 1){
+          kScore <- c(kScore, kmeans(pcs, k[i])$tot.withinss + penalty[i])
+      }else{
+          kScore <- c(kScore, kmeanspp(pcs, k[i], iter.max = 500)$tot.withinss + penalty[i])
+      }
+    }
+    return(kScore)
+}  
+```
+
+# Find the optimal number of clusters at each time state
+
+Add a column in the "kScores" Data.frame.
+
+```{r}
+optimal.k <- function(score, k){
+    score['OptimalK'] <- k[1]
+    for (i in 1:nrow(score)){
+        min.score <- score[i,2]
+        optimal <- k[1]
+        for (j in 3:(length(k)+1)){
+            if (score[i,j] < min.score){
+                min.score <- score[i,j]
+                optimal <- k[j-1]
+            }
+        }
+        score['OptimalK'][i,] <- optimal
+    }
+    return(score)
+}
+```
+
+# Calculate all K-means Scores using sliding windows
+
+# Edit date
+
+```{r}
+editDate <- function(df, start){
+  year <- 2000 + start%/%12
+  if (start %% 12>8){
+      year <- year+1
+      month <- 4 + start %% 12 - 12
+  }else{
+      month <- 4 + start %% 12
+  } 
+  
+  df['Date']<-0
+  for (j in 1:nrow(df)){
+      if (month > 12){
+          month <- 1
+          year <- year + 1
+      }
+      df['Date'][j,] <- sprintf("%s-%s-%s", year, month, 1)
+      month <- month + 1
+  }
+  
+  # Split the months and years 
+  df$Date <- as.Date(df$Date,format = "%Y-%m-%e")
+  df$Year <- as.integer(substring(df$Date,1,4))
+  df$Month <- as.integer(substring(df$Date,6,7))
+  df$Decade <- ifelse(df$Year<2013, 1, 2)
+  
+  mymonths <- c("Jan","Feb","Mar",
+              "Apr","May","Jun",
+              "Jul","Aug","Sep",
+              "Oct","Nov","Dec")
+  #add abbreviated month name
+  df$MonthAbb <- mymonths[ df$Month ]
+  return(df)
+}
+```
+
+Return a data.frame with row number equals to time states.
+From column 2\~6, return each K-means Score with different penalty term.
+The function calculates K-Scores at each time state from start to end, for each time state T, it uses whole information of the sliding window which end at T.
+Overlap is the parameter between 0\~1, which controls the overlap size between each two successive windows.
+
+```{r}
+gen.kScore <- function(data, start, end, window.len, overlap = 1, power, k){
+    shift <- ifelse(overlap == 1, 1, as.integer(window.len * (1-overlap)))
+    kScores <- c()
+    # Expanding window
+    if (window.len==0){
+        for (t in start:end){
+            kScores <- cbind(kScores, Cal.kScore(t, data, power, window.len=t, k))
+        }
+        # kScores <- foreach (t = start:end, .combine=c) %dopar% {
+        #             Cal.kScore(t, data, power, window.len=t, k)
+        # }
+    }
+    # Rolling window
+    else{
+      for (t in seq(start,end,by=shift)){
+        kScores <- cbind(kScores, Cal.kScore(t, data, power, window.len, k))
+      }
+        # kScores <- foreach (t = seq(start,end,by=shift), .combine=c) %dopar% {
+        #             Cal.kScore(t, data, power, window.len, k)
+        # }
+  }
+  
+    kScores <- data.frame(t(matrix(rbind(seq(start, end, by=shift), kScores),length(k)+1)))
+    
+    # Set Data.frame
+    name <- c("Date")
+    for (i in 1:length(k)){
+        name <- c(name, paste0("S",k[i]))
+    }
+    colnames(kScores) <- name
+
+    # Set year-month as indices
+    kScores <- editDate (kScores, start)
+
+    kScores <- optimal.k(kScores, k)
+    return(kScores)
+}
+```
+
+# Plot K-Means Scores
+
+```{r}
+plot.C <- function(kScores){
+    clusters=c("K=2"=brewer.pal(7, "Set1")[1], "K=3"=brewer.pal(7, "Set1")[2], "K=4"=brewer.pal(7, "Set1")[3],"K=5"=brewer.pal(7, "Set1")[4],"K=6"="navyblue")
+    p1 <- ggplot(kScores)+ 
+            geom_point(aes(Date,y=S2,fill=clusters[1]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=S3,fill=clusters[2]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=S4,fill=clusters[3]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=S5,fill=clusters[4]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=S6,fill=clusters[5]),size=1,shape=21,stroke=0.1)+
+            geom_line(aes(Date,y=S2),color=clusters[1],size=0.4)+
+            geom_line(aes(Date,y=S3),color=clusters[2],size=0.4)+
+            geom_line(aes(Date,y=S4),color=clusters[3],size=0.4)+
+            geom_line(aes(Date,y=S5),color=clusters[4],size=0.4)+
+            geom_line(aes(Date,y=S6),color=clusters[5],size=0.4)+
+            scale_x_date(date_labels = "%m-%Y") +
+            labs(subtitle = "2000-04 to 2022-02",
+                    x = "", y = "kScore")  +
+            scale_fill_brewer(palette='Set1',limits=c("K=2","K=3","K=4","K=5","K=6")) +
+            theme(axis.text.x = element_text(angle = 90,hjust = 0.5,vjust = 0.5),
+                  plot.title = element_text(hjust = 0.5)) 
+    return(p1)
+}
+```
+
+# Plot Silhouette Scores
+
+```{r}
+plot.Sil <- function(Scores){
+    clusters=c("K=2"=brewer.pal(7, "Set1")[1], "K=3"=brewer.pal(7, "Set1")[2], "K=4"=brewer.pal(7, "Set1")[3],"K=5"=brewer.pal(7, "Set1")[4],"K=6"=brewer.pal(7, "Set1")[5])
+    p2 <- ggplot(Scores)+ geom_point(aes(Date,y=Sil2,fill=clusters[1]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=Sil3,fill=clusters[2]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=Sil4,fill=clusters[3]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=Sil5,fill=clusters[4]),size=1,shape=21,stroke=0.1)+
+            geom_point(aes(Date,y=Sil6,fill=clusters[5]),size=1,shape=21,stroke=0.1)+
+            geom_line(aes(Date,y=Sil2),color=clusters[1],size=0.4)+
+            geom_line(aes(Date,y=Sil3),color=clusters[2],size=0.4)+
+            geom_line(aes(Date,y=Sil4),color=clusters[3],size=0.4)+
+            geom_line(aes(Date,y=Sil5),color=clusters[4],size=0.4)+
+            geom_line(aes(Date,y=Sil6),color=clusters[5],size=0.4)+
+            scale_x_date(date_labels = "%m-%Y") +
+            labs(title = "Precipitation Fused Data",
+                 subtitle = "2000-04 to 2022-02")  +
+            labs(y = "Silhouette Score") +
+            scale_fill_brewer(palette='Set1',limits=c("K=2","K=3","K=4","K=5","K=6")) +
+            theme(axis.text.x = element_text(angle = 90,hjust = 0.5,vjust = 0.5), plot.title = element_text(hjust = 0.5))
+    return(p2)
+}
+```
+
+# Analyse kScores
+
+```{r}
+mean_kScore <- function(kScores){
+    return(mean(kScores$OptimalK))
+}
+table_kScore <- function(kScores){
+    return(table(kScores$OptimalK))
+}
+
+table_kScore_month <- function(kScores, month){
+    return(table(kScores[which(kScores['Month']==as.character(month),),]$OptimalK))
+}
+plot_kScore_decade1 <- function(kScores){
+     p <- ggplot(kScores,aes(x=factor(Month)))+geom_bar(aes(fill=factor(OptimalK)), position="dodge", width = 0.8) + labs(title = "First Decade") + labs(x="month")
+    return(p)
+}
+
+plot_kScore_decade2 <- function(kScores){
+     p <- ggplot(kScores,aes(x=factor(Month)))+geom_bar(aes(fill=factor(OptimalK)), position="dodge", width = 0.8) + labs(title = "Second Decade") + labs(x="month")
+    return(p)
+}
+```
+
+# Fused Data kScores
+
+Import Data
+
+```{r}
+FusedData <- read.csv('FusedData')
+head(FusedData)
+```
+```{r}
+matplot(t(FusedData[1:10,]),
+        lty=1,
+        type = "l", 
+        lwd = 2,
+        ylab="Precipitation",
+        xlab="Month",
+        col = brewer.pal(8, "Dark2")[1:10])
+```
+
+
+# Window 36
+
+```{r}
+kScores1 = gen.kScore(FusedData, start=36, end=263, window.len=36, power=1, k=seq(2,5))
+kScores2 = gen.kScore(FusedData, start=36, end=263, window.len=36, power=1, k=seq(2,6))
+kScores3 = gen.kScore(FusedData, start=36, end=263, window.len=36, power=1, k=seq(2,6))
+
+# kScores4 = gen.kScore(FusedData, start=36, end=263, window.len=36, power=1, k=seq(2,5))
+```
+
+```{r}
+# ggsave(filename=paste0("kScores.jpg"), width = 6000, height = 4000, unit="px")
+# save(kScores1,file="kScore1-window36.RData")
+```
+
+# Overview
+
+```{r}
+plot.C(kScores1)
+mean_kScore(kScores1)
+table_kScore(kScores1)
+table(kScores1$Decade)
+# for (i in 1:12){
+#     print(table_kScore_month(kScores1,i))
+# }
+```
+
+```{r}
+plot.C(kScores3)
+mean_kScore(kScores2)
+table_kScore(kScores2)
+```
+
+```{r}
+ggplot(kScores2,aes(x=factor(OptimalK)))+geom_bar(aes(fill=factor(Decade)), position="dodge", width = 0.8) + labs(title = "Decade: First v.s. Second") + labs(x="Optimal K")
+```
+
+```{r}
+kScores3
+plot.C(kScores3)
+ggplot(kScores3,aes(x=factor(OptimalK)))+geom_bar(aes(fill=factor(Decade)), position="dodge", width = 0.8) + labs(title = "Decade: First v.s. Second") + labs(x="Optimal K")
+```
+
+# Analysis by decades and months
+
+```{r}
+for (i in 1:12){
+    print(table_kScore_month(kScores3[which(kScores3['Year']<2013),], i))
+}
+```
+
+```{r}
+for (i in 1:12){
+    print(table_kScore_month(kScores3[which(kScores3['Year']>=2013),], i))
+}
+```
+
+```{r}
+plot_kScore_decade1(kScores5[which(kScores5['Year']<2013),])
+```
+
+```{r}
+plot_kScore_decade2(kScores8[which(kScores8['Year']>=2013),])
+```
+
+```{r}
+# kScores3 %>% filter(Year < 2013) %>%
+#     select(OptimalK, Month, Year) %>%
+#     group_by(OptimalK) %>%
+```
+
+# Calculate Silhouette Score
+
+```{r}
+start = 36
+end = 263
+sil.score1 <- foreach (t = start:end, .combine=rbind) %dopar% {
+    library(fda)
+    library(bios2mds)
+    pcs <- PCscore(t, FusedData, 36)
+    sil.score(cbind(pcs$Harm1, pcs$Harm2), nb.clus = c(2:6),
+ nb.run = 100, iter.max = 100)[2:6]
+}
+```
+
+```{r}
+# save(sil.score1,file="silscore1-window36.RData")
+```
+
+```{r}
+sil.score1 <- data.frame(sil.score1)
+# sil.score1
+name <- c()
+for (i in 2:6){
+    name <- c(name, paste0("Sil",i))
+}
+colnames(sil.score1) <- name
+
+# Set year-month as indices
+year <- 2000 + start%/%12
+if (start %% 12>8){
+    year <- year+1
+    month <- 4 + start %% 12 - 12
+}else{
+    month <- 4 + start %% 12
+} 
+
+sil.score1['Date'] <- 0
+for (j in 1:nrow(sil.score1)){
+    if (month > 12){
+        month <- 1
+        year <- year + 1
+    }
+    sil.score1['Date'][j,] <- sprintf("%s-%s-%s", year, month, 1)
+    month <- month + 1
+}
+
+sil.score1$Date <- as.Date(sil.score1$Date,format = "%Y-%m-%e")
+```
+
+```{r}
+plot.Sil(sil.score1)
+```
+
+# Perfrom K-Means partitions
+
+```{r}
+start = 36
+end = 263
+clusters <- data.frame()
+
+for (i in 36:263){
+  pcs <- PCscore(endt = i, FusedData, window.len = 36)
+  c <- kmeanspp(pcs, 3, iter.max = 500)
+
+  year <- 2000 + i%/%12
+  if (i %% 12>8){
+      year <- year+1
+      month <- 4 + i %% 12 - 12
+  }else{
+      month <- 4 + i %% 12
+  } 
+  Date <- sprintf("%s-%s-%s", year, month, 1)
+  Date <- as.Date(Date,format = "%Y-%m-%e")
+  
+    mymonths <- c("Jan","Feb","Mar",
+              "Apr","May","Jun",
+              "Jul","Aug","Sep",
+              "Oct","Nov","Dec")
+
+  new_clusters <- data.frame(Lon = Fused.Locations$Lon, Lat = Fused.Locations$Lat, Cluster = c$cluster, 
+                             Date = Date, Year = year, Month = month, Decade = ifelse(year<2013, 1, 2), 
+                             MonthAbb = mymonths[ month ])
+  clusters <- rbind(clusters, new_clusters)
+}
+clusters$Year <- as.integer(clusters$Year)
+clusters$Month <- as.integer(clusters$Month)
+clusters$MonthAbb <- as.factor(clusters$MonthAbb)
+```
+
+```{r}
+fdafd <- gen.fdafd(36, FusedData, window.len=36)
+fdapcaList <- pca.fd(fdafd,nharm=2)
+op <- par(mfrow=c(2,1))
+plot.pca.fd(fdapcaList, cex.main=0.9)
+par(op)
+```
+
+```{r}
+fdabasis = create.bspline.basis(c(1, 263), floor(263/6))
+fdatime = seq(1, 263)
+fdafd = smooth.basis(fdatime, t(FusedData), fdabasis)$fd
+fdafd$fdnames[[1]] = "Timestate"
+fdafd$fdnames[[2]] = "Precipitation"
+fdapcaList <- pca.fd(fdafd,nharm=2)
+op <- par(mfrow=c(2,1))
+plot.pca.fd(fdapcaList)
+par(op)
+```

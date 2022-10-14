@@ -1,0 +1,72 @@
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = 'E:/Code/R/Research/precipitation/FusedData')
+```
+
+# Load Packages
+
+```{r, warning=FALSE}
+library(fda)
+library(LICORS)
+library(ggplot2)
+library(gganimate)
+library(cluster)
+library(RColorBrewer)
+library(tidyverse)
+```
+```{r}
+library(rgdal)
+aus.states <- readOGR( 
+  dsn= ".",
+  layer="STE_2021_AUST_GDA2020"
+)
+```
+```{r}
+FusedData <- read.csv('FusedData')
+Fused.Locations <- read.csv('Fused.Locations')
+FusedData[,250:261]
+Temp.df = data.frame(Lon = Fused.Locations$Lon, Lat = Fused.Locations$Lat, Precip = FusedData[,263])
+Temp.df['Month'] <- 2 
+head(Temp.df)
+```
+
+```{r}
+m <- 0
+df1 <- data.frame()
+for (i in 250:261){
+    m <- m+1
+    Temp.df = data.frame(Lon = Fused.Locations$Lon, Lat = Fused.Locations$Lat, Precip = FusedData[,i])
+    Temp.df['Month'] <- month.name[m]
+    df1 <- rbind(df1, Temp.df)
+}
+```
+```{r}
+df1$Month <- factor(df1$Month, levels = month.name)
+```
+
+```{r}
+ggplot(df1) + 
+    geom_point(mapping = aes(x = Lon, y = Lat, colour = Precip), size = 0.5) +
+    facet_wrap(~Month, ncol = 4) +
+    theme_bw() +
+    labs(x = "Longitude", y = "Latitude", title = "2021 Monthly Precipitation", colour = "Precipitation (mm)")+
+    xlim(113, 155) + ylim(-45,-9) +
+    geom_polygon(data = aus.states, aes(x = long, y = lat, group = group), colour = "black", fill = NA) +
+    scale_colour_gradientn(colours=c("#00007F", "blue", "#007FFF", "cyan",
+                               "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"), values = seq(0,1, length.out = 9))
+# ggsave(filename="2021.jpg", width = 2400, height = 1800, unit="px")
+```
+
+
+
+```{r}
+ggplot() + 
+  geom_point(Temp.df, mapping = aes(x = Lon, y = Lat, colour = Precip), size = 1) +
+  theme_bw() + labs(x = "Longitude", y = "Latitude", title = "2022-4 Precipitation", colour = "Precipitation (mm)")+ 
+  xlim(113, 155) + ylim(-45,-9) +
+  geom_polygon(data = aus.states, aes(x = long, y = lat, group = group), colour = "black", fill = NA) +
+  scale_colour_gradientn(colours=c("#00007F", "blue", "#007FFF", "cyan",
+                                   "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"), values = seq(0,1, length.out = 9))
+
+```
+
+
